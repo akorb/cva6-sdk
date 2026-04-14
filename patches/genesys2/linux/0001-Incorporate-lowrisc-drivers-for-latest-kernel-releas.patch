@@ -18,9 +18,9 @@ Signed-off-by: Andreas Korb <andreas.korb@aisec.fraunhofer.de>
  drivers/net/ethernet/Makefile                 |   1 +
  drivers/net/ethernet/lowrisc/Kconfig          |  26 +
  drivers/net/ethernet/lowrisc/Makefile         |   5 +
- drivers/net/ethernet/lowrisc/lowrisc_100MHz.c | 751 ++++++++++++++++++
+ drivers/net/ethernet/lowrisc/lowrisc_100MHz.c | 762 ++++++++++++++++++
  drivers/net/ethernet/lowrisc/lowrisc_100MHz.h |  55 ++
- 6 files changed, 839 insertions(+)
+ 6 files changed, 850 insertions(+)
  create mode 100644 drivers/net/ethernet/lowrisc/Kconfig
  create mode 100644 drivers/net/ethernet/lowrisc/Makefile
  create mode 100644 drivers/net/ethernet/lowrisc/lowrisc_100MHz.c
@@ -98,7 +98,7 @@ new file mode 100644
 index 0000000..7e0cc6c
 --- /dev/null
 +++ b/drivers/net/ethernet/lowrisc/lowrisc_100MHz.c
-@@ -0,0 +1,751 @@
+@@ -0,0 +1,762 @@
 +/*
 + * Lowrisc Ether100MHz Linux driver for the Lowrisc Ethernet 100MHz device.
 + *
@@ -163,8 +163,8 @@ index 0000000..7e0cc6c
 +	int last_duplex;
 +	int last_carrier;
 +
-+	/* Mutex */
-+	struct mutex lock;
++	/* Serialize xmit, tx_timeout, and MACHI register access */
++	spinlock_t lock;
 +	uint32_t last_mdio_gpio;
 +	int irq;
 +
@@ -246,13 +246,15 @@ index 0000000..7e0cc6c
 +				   const u8 *address_ptr)
 +{
 +	uint32_t macaddr_lo, macaddr_hi;
++	unsigned long flags;
++
 +	memcpy(&macaddr_lo, address_ptr + 2, sizeof(uint32_t));
 +	memcpy(&macaddr_hi, address_ptr + 0, sizeof(uint16_t));
-+	mutex_lock(&priv->lock);
++	spin_lock_irqsave(&priv->lock, flags);
 +	eth_write(priv, MACLO_OFFSET, htonl(macaddr_lo));
 +	eth_write(priv, MACHI_OFFSET, htons(macaddr_hi));
 +	eth_write(priv, RFCS_OFFSET, 8); /* use 8 buffers */
-+	mutex_unlock(&priv->lock);
++	spin_unlock_irqrestore(&priv->lock, flags);
 +}
 +
 +/**
@@ -266,10 +268,12 @@ index 0000000..7e0cc6c
 +static void lowrisc_read_mac_address(struct net_local *priv, u8 *address_ptr)
 +{
 +	uint32_t macaddr_hi, macaddr_lo;
-+	mutex_lock(&priv->lock);
++	unsigned long flags;
++
++	spin_lock_irqsave(&priv->lock, flags);
 +	macaddr_hi = ntohs(eth_read(priv, MACHI_OFFSET) & MACHI_MACADDR_MASK);
 +	macaddr_lo = ntohl(eth_read(priv, MACLO_OFFSET));
-+	mutex_unlock(&priv->lock);
++	spin_unlock_irqrestore(&priv->lock, flags);
 +	memcpy(address_ptr + 2, &macaddr_lo, sizeof(uint32_t));
 +	memcpy(address_ptr + 0, &macaddr_hi, sizeof(uint16_t));
 +}
@@ -308,6 +312,7 @@ index 0000000..7e0cc6c
 +static void lowrisc_tx_timeout(struct net_device *ndev, unsigned int txqueue)
 +{
 +	struct net_local *priv = netdev_priv(ndev);
++	unsigned long flags;
 +
 +	netdev_err(ndev, "Exceeded transmit timeout of %lu ms\n",
 +		   TX_TIMEOUT * 1000UL / HZ);
@@ -315,14 +320,14 @@ index 0000000..7e0cc6c
 +	ndev->stats.tx_errors++;
 +
 +	/* Reset the device */
-+	mutex_lock(&priv->lock);
++	spin_lock_irqsave(&priv->lock, flags);
 +	/* Shouldn't really be necessary, but shouldn't hurt */
 +	netif_stop_queue(ndev);
 +	/* To exclude tx timeout */
 +	netif_trans_update(ndev); /* prevent tx timeout */
 +	/* We're all ready to go. Start the queue */
 +	netif_wake_queue(ndev);
-+	mutex_unlock(&priv->lock);
++	spin_unlock_irqrestore(&priv->lock, flags);
 +}
 +
 +/**
@@ -336,15 +341,16 @@ index 0000000..7e0cc6c
 +static int lowrisc_close(struct net_device *ndev)
 +{
 +	struct net_local *priv = netdev_priv(ndev);
++	unsigned long flags;
 +
 +	if (!ndev->phydev)
 +		return -ENODEV;
 +
 +	netif_stop_queue(ndev);
 +	napi_disable(&priv->napi);
-+	mutex_lock(&priv->lock);
++	spin_lock_irqsave(&priv->lock, flags);
 +	eth_disable_irq(priv);
-+	mutex_unlock(&priv->lock);
++	spin_unlock_irqrestore(&priv->lock, flags);
 +
 +	netdev_info(ndev, "Close device, free interrupt\n");
 +	free_irq(priv->irq, priv);
@@ -528,13 +534,15 @@ index 0000000..7e0cc6c
 + * This function allocates memory for a socket buffer, fills it with data
 + * received and hands it over to the TCP/IP stack.
 + *
-+ * Return:	Number of packets processed, or 1 if more work remains
++ * Return:	Number of packets processed
 + */
 +static int lowrisc_ether_poll(struct napi_struct *napiptr, int budget)
 +{
 +	int rsr, buf, rx_count = 0;
 +	struct net_local *priv = container_of(napiptr, struct net_local, napi);
 +	struct net_device *ndev = priv->ndev;
++	unsigned long flags;
++
 +	rsr = eth_read(priv, RSR_OFFSET);
 +	buf = rsr & RSR_RECV_FIRST_MASK;
 +	/* Check if there is Rx Data available */
@@ -566,30 +574,26 @@ index 0000000..7e0cc6c
 +		rsr = eth_read(priv, RSR_OFFSET);
 +	}
 +
-+	if (rsr & RSR_RECV_DONE_MASK) {
-+		return 1;
-+	} else {
++	if (rx_count < budget) {
 +		napi_complete_done(&priv->napi, rx_count);
++		spin_lock_irqsave(&priv->lock, flags);
 +		eth_enable_irq(priv);
-+		return 0;
++		spin_unlock_irqrestore(&priv->lock, flags);
 +	}
++	return rx_count;
 +}
 +
 +static irqreturn_t lowrisc_ether_isr(int irq, void *priv_id)
 +{
-+	int rsr = 0;
 +	struct net_local *priv = priv_id;
-+	struct net_device *ndev = priv->ndev;
++	unsigned long flags;
++
 +	if (napi_schedule_prep(&priv->napi)) {
++		spin_lock_irqsave(&priv->lock, flags);
 +		eth_disable_irq(priv);
++		spin_unlock_irqrestore(&priv->lock, flags);
 +		__napi_schedule(&priv->napi);
-+	} else /* we are in denial of service mode */
-+		do {
-+			int buf = rsr & RSR_RECV_FIRST_MASK;
-+			ndev->stats.rx_dropped++;
-+			eth_write(priv, RSR_OFFSET, ++buf);
-+			rsr = eth_read(priv, RSR_OFFSET);
-+		} while (rsr & RSR_RECV_DONE_MASK);
++	}
 +	return IRQ_HANDLED;
 +}
 +
@@ -611,7 +615,6 @@ index 0000000..7e0cc6c
 +	memset(p, 0, LOWRISC_REGS_LEN * sizeof(u32));
 +
 +	regs->version = 0;
-+	mutex_lock(&priv->lock);
 +	for (i = 0; i < LOWRISC_REGS_LEN; i++) {
 +		if (i >= 32)
 +			regs_buff[i] =
@@ -619,7 +622,6 @@ index 0000000..7e0cc6c
 +		else if (phy)
 +			regs_buff[i] = phy_read(phy, i);
 +	}
-+	mutex_unlock(&priv->lock);
 +}
 +
 +static const struct ethtool_ops lowrisc_ethtool_ops = {
@@ -639,8 +641,9 @@ index 0000000..7e0cc6c
 + */
 +static int lowrisc_open(struct net_device *ndev)
 +{
-+	int retval;
 +	struct net_local *priv = netdev_priv(ndev);
++	unsigned long flags;
++	int retval;
 +	ndev->ethtool_ops = &lowrisc_ethtool_ops;
 +
 +	/* Set the MAC address each time opened */
@@ -669,7 +672,9 @@ index 0000000..7e0cc6c
 +	netif_start_queue(ndev);
 +
 +	/* enable the irq */
++	spin_lock_irqsave(&priv->lock, flags);
 +	eth_enable_irq(priv);
++	spin_unlock_irqrestore(&priv->lock, flags);
 +	return 0;
 +}
 +
@@ -689,14 +694,18 @@ index 0000000..7e0cc6c
 +{
 +	struct net_local *priv = netdev_priv(ndev);
 +	unsigned int len = new_skb->len;
++	unsigned long flags;
 +	int rslt;
-+	if (mutex_is_locked(&priv->lock))
-+		return NETDEV_TX_BUSY;
++
++	spin_lock_irqsave(&priv->lock, flags);
 +	rslt = eth_read(priv, TPLR_OFFSET);
-+	if (rslt & TPLR_BUSY_MASK)
++	if (rslt & TPLR_BUSY_MASK) {
++		spin_unlock_irqrestore(&priv->lock, flags);
 +		return NETDEV_TX_BUSY;
++	}
 +	eth_copyout(priv, new_skb->data, len);
 +	eth_write(priv, TPLR_OFFSET, len);
++	spin_unlock_irqrestore(&priv->lock, flags);
 +
 +	skb_tx_timestamp(new_skb);
 +
@@ -733,12 +742,14 @@ index 0000000..7e0cc6c
 +{
 +	struct net_local *priv = netdev_priv(ndev);
 +	volatile uint64_t *eth_base = (volatile uint64_t *)(priv->ioaddr);
++	unsigned long flags;
 +
++	spin_lock_irqsave(&priv->lock, flags);
 +	if (ndev->flags & IFF_PROMISC)
-+		/* Set promiscuous */
 +		eth_base[MACHI_OFFSET >> 3] |= MACHI_ALLPKTS_MASK;
 +	else
 +		eth_base[MACHI_OFFSET >> 3] &= ~MACHI_ALLPKTS_MASK;
++	spin_unlock_irqrestore(&priv->lock, flags);
 +}
 +
 +static struct net_device_ops lowrisc_netdev_ops = {
@@ -788,7 +799,7 @@ index 0000000..7e0cc6c
 +	if (IS_ERR(priv->ioaddr))
 +		return PTR_ERR(priv->ioaddr);
 +
-+	mutex_init(&priv->lock);
++	spin_lock_init(&priv->lock);
 +
 +	ndev->netdev_ops = &lowrisc_netdev_ops;
 +	ndev->flags &= ~IFF_MULTICAST;
