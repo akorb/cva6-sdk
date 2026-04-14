@@ -19,8 +19,8 @@ Signed-off-by: Andreas Korb <andreas.korb@aisec.fraunhofer.de>
  drivers/net/ethernet/lowrisc/Kconfig          |  26 +
  drivers/net/ethernet/lowrisc/Makefile         |   5 +
  drivers/net/ethernet/lowrisc/lowrisc_100MHz.c | 762 ++++++++++++++++++
- drivers/net/ethernet/lowrisc/lowrisc_100MHz.h |  55 ++
- 6 files changed, 850 insertions(+)
+ drivers/net/ethernet/lowrisc/lowrisc_100MHz.h |  49 ++
+ 6 files changed, 844 insertions(+)
  create mode 100644 drivers/net/ethernet/lowrisc/Kconfig
  create mode 100644 drivers/net/ethernet/lowrisc/Makefile
  create mode 100644 drivers/net/ethernet/lowrisc/lowrisc_100MHz.c
@@ -866,7 +866,7 @@ new file mode 100644
 index 0000000..9d227c1
 --- /dev/null
 +++ b/drivers/net/ethernet/lowrisc/lowrisc_100MHz.h
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,49 @@
 +// See LICENSE for license details.
 +
 +#ifndef ETH_HEADER_H
@@ -914,12 +914,6 @@ index 0000000..9d227c1
 +#define RSR_RECV_LAST_MASK    0x00000F00      /* last available rx buffer (static) */
 +#define RSR_RECV_DONE_MASK    0x00001000      /* Rx complete */
 +#define RSR_RECV_IRQ_MASK     0x00002000      /* Rx irq bit */
-+
-+/* General Ethernet Definitions */
-+#define HEADER_OFFSET               12      /* Offset to length field */
-+#define HEADER_SHIFT                16      /* Shift value for length */
-+#define ARP_PACKET_SIZE             28      /* Max ARP packet size */
-+#define HEADER_IP_LENGTH_OFFSET     16      /* IP Length Offset */
 +
 +#endif
 -- 
